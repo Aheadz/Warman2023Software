@@ -1,2 +1,1 @@
-
-![My Image](Robot3.jpg)
+![My Image](Robot3.png)
