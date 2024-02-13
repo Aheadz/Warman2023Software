@@ -1,0 +1,1355 @@
+#include <Arduino.h>
+#include <Adafruit_PWMServoDriver.h>
+#include "ICM_20948.h"
+#include <Wire.h>
+#include <string.h>
+#include <stdio.h>
+#include <EEPROM.h>
+#include <math.h>
+#include <util/atomic.h>
+
+
+
+
+// #include "SparkFun_VL53L1X.h"
+/*
+PIN ASSIGNMENTS:
+Motor Right --> D1 & D2
+Motor Left  --> D3 & D4
+Scissor Lift --> D5 & D6
+Scoop Servo --> D9
+Containment Gate --> D10
+Swing Arm Right --> D11
+Swing Arm Left  --> D12
+*/
+// PWM CONTROLLER VARIABLES
+
+#define SCISSOR_LIFT_UP 2
+#define SCISSOR_LIFT_DOWN 3
+
+#define SCOOP_PIN 2
+#define GATE_PIN 4
+#define ARM_RIGHT_PIN 3
+#define ARM_LEFT_PIN 4
+
+#define ARM_SPEED 50
+#define SERVO_MIN 150
+#define SERVO_MAX 600
+
+#define MOTOR_RIGHT_IN1 8
+#define MOTOR_RIGHT_IN2 9
+#define MOTOR_RIGHT_EN 10
+
+#define MOTOR_LEFT_IN1 4
+#define MOTOR_LEFT_IN2 5
+#define MOTOR_LEFT_EN 6
+
+// How many motors
+#define NMOTORS 2
+
+#define IMU_START_DELAY 1000
+#define IMU_END_DELAY 1000
+
+
+#define ROTATION_TOLERANCE 1.0
+struct biasStore
+{
+  int32_t header = 0x42;
+  int32_t biasGyroX = 0;
+  int32_t biasGyroY = 0;
+  int32_t biasGyroZ = 0;
+  int32_t biasAccelX = 0;
+  int32_t biasAccelY = 0;
+  int32_t biasAccelZ = 0;
+  int32_t biasCPassX = 0;
+  int32_t biasCPassY = 0;
+  int32_t biasCPassZ = 0;
+  int32_t sum = 0;
+};
+
+struct orientation{
+  int time;
+  double yaw;
+  double pitch;
+  double roll;
+  int motorRight;
+  int motorLeft;
+};
+
+typedef enum
+{
+  START,
+  MANUAL,
+  AUTO,
+  CALIBRATE,
+} robotMode;
+
+typedef enum
+{
+  SCOOP,
+  LIFTLEFT,
+  LIFTRIGHT,
+  GATE,
+  CONTAINMENT,
+} servoID;
+
+//Motor Encoder Functions
+// A class to compute the control signal
+class SimplePID{
+  private:
+    float kp, kd, ki, umax; // Parameters
+    float eprev, eintegral; // Storage
+
+  public:
+  // Constructor
+  SimplePID() : kp(1), kd(0), ki(0), umax(255), eprev(0.0), eintegral(0.0){}
+
+  // A function to set the parameters
+  void setParams(float kpIn, float kdIn, float kiIn, float umaxIn)
+  {
+    kp = kpIn; kd = kdIn; ki = kiIn; umax = umaxIn;
+  }
+
+  // A function to compute the control signal
+  void evalu(int value1, int target, float deltaT, int &pwr, int &dir)
+  {
+    // error
+    int e = target - value1;
+  
+    // derivative
+    float dedt = (e-eprev)/(deltaT);
+  
+    // integral
+    eintegral = eintegral + e*deltaT;
+  
+    // control signal
+    float u = kp*e + kd*dedt + ki*eintegral;
+  
+    // motor power
+    pwr = (int) fabs(u);
+    if( pwr > umax ){
+      pwr = umax;
+    }
+  
+    // motor direction
+    dir = 1;
+    if(u<0){
+      dir = -1;
+    }
+  
+    // store previous error
+    eprev = e;
+  }
+
+
+};
+
+// I2C Devices
+Adafruit_PWMServoDriver servos = Adafruit_PWMServoDriver();
+ICM_20948_I2C myICM;
+// SFEVL53L1X distanceSensor;
+#define IMU_DATA_SIZE 300
+int IMUDataCount = 0;
+orientation IMUData[IMU_DATA_SIZE];
+char command[32];
+char commandType[5];
+char direction;
+int time = 0;
+int value = 0;
+int start = 0;
+int current = 0;
+int revolutions = 0;
+int speed = 0;
+int servoNum = 0;
+int currentArmAngle = 180;
+int servoRightAngle = 205;
+int servoLeftAngle = 115;
+int pulselength = 0;
+int pulselength2 = 0;
+int pwmOutput;
+int lefttrackMod = 0;
+int righttrackMod = 0;
+int deltaAngle = 0;
+int containmentAngle = 90;
+double y = 0;
+double p = 0;
+double r = 0;
+double yaw_Kp = 1.1;
+double yaw_Ki = 0.5;
+double yaw_integral = 0;
+// targets
+float target_f[] = {0,0,0,0};
+long target[]    = {0,0,0,0};
+
+volatile int drivetime = 0;
+volatile int sampletime = 0;
+int mode = robotMode::START;
+
+// Motor Pins
+const int enca[] = {18,19};
+const int encb[] = {12,13};
+const int pwm[] = {10,6};
+const int in1[] = {8,9};
+const int in2[] = {4,5};
+
+// Motor Globals
+long prevT = 0;
+volatile int posi[] = {0,0};
+
+// PID class instances
+SimplePID pid[NMOTORS];
+
+void executeCommand();
+void scissorLiftActuate(int direction, int duration);
+void scoop(int angle);
+void arm(int speed1, int angle);
+void gate(int angle);
+void forwardBack(int direction, int time, int speed1);
+void rotate(int direction, double angle, int speed1);
+void runMission();
+void init_motor();
+void motor(int revs, int speed1);
+void setMotor(int dir, int pwmVal, int pwm, int in1, int in2);
+void setTarget(float t, float deltat);
+void readEncoder0();
+void readEncoder1();
+
+
+//IMU Functions
+void init_imu();
+void calibrate_imu();
+bool isBiasStoreValid(biasStore *store);
+void updateBiasStoreSum(biasStore *store);
+void printBiases(biasStore *store);
+void getYawPitchRoll();
+void recordYaw(double& yaw, double& pitch, double& roll,int right,int left);
+void outputYaw();
+
+// int getdistance();
+
+void dumpMemory(uint16_t stop);
+
+void setup()
+{
+  Serial.begin(115200);
+  Serial.println("SYSTEM STARTING!!!");
+  init_imu();
+  init_motor();
+  Serial.println("SYSTEM INITIALIZED!!!");
+
+  servos.begin();
+  servos.setPWMFreq(60);
+  servos.setPWM(servoID::LIFTLEFT, 0, map(115, 0, 270, SERVO_MIN, SERVO_MAX));
+  servos.setPWM(servoID::LIFTRIGHT, 0, map(205, 0, 270, SERVO_MIN, SERVO_MAX));
+  servos.setPWM(servoID::SCOOP, 0, map(140, 0, 270, SERVO_MIN, SERVO_MAX));
+  servos.setPWM(servoID::GATE, 0, map(0, 0, 270, SERVO_MIN, SERVO_MAX));
+  servos.setPWM(servoID::CONTAINMENT, 0, map(containmentAngle, 0, 180, SERVO_MIN, SERVO_MAX));
+  pinMode(SCISSOR_LIFT_UP, OUTPUT);
+  pinMode(SCISSOR_LIFT_DOWN, OUTPUT);
+  sei();
+}
+
+void loop()
+{
+  if (mode == robotMode::START)
+  {
+    Serial.readBytes(command, 16);
+    sscanf(command, "%3s", commandType);
+    if ((strcmp(commandType, "MAN")) == 0)
+    {
+      Serial.println("Manual Mode Activated");
+      mode = robotMode::MANUAL;
+    }
+    else if ((strcmp(commandType, "GO!")) == 0)
+    {
+      mode = robotMode::AUTO;
+    }
+    else if ((strcmp(commandType, "CAL")) == 0)
+    {
+      Serial.println("Commencing IMU Calibration (will take 2 Minutes)");
+      calibrate_imu();
+      Serial.println("Calibration Complete!");
+      mode = robotMode::MANUAL;
+    }
+    else if ((strcmp(commandType, "DMP")) == 0)
+    {
+      sscanf(command, "%*3s %04d", &value);
+      dumpMemory(value);
+    }
+  }
+  else if (mode == robotMode::MANUAL)
+  {
+    executeCommand();
+  }
+  else if (mode == robotMode::AUTO)
+  {
+    runMission();
+  }
+  commandType[0] = '\0';
+  command[0] = '\0';
+}
+
+void runMission()
+{
+
+}
+
+void executeCommand()
+{
+  Serial.readBytes(command, 32);
+  sscanf(command, "%3s", commandType);
+  // Scoop Actuate:    SCP [Angle] ---> "SCP 210"
+  if (strcmp(commandType, "SCP") == 0)
+  {
+    command[strlen(command) + 1] ='\0';
+    Serial.println(command);
+    sscanf(command, "%*3s %04d", &value);
+    pulselength = map(value, 0, 270, SERVO_MIN, SERVO_MAX);
+    servos.setPWM(servoID::SCOOP, 0, pulselength);
+  }
+  // Containment Gate: GTE [Direction +|-] --->                 "GTE -"
+  else if (strcmp(commandType, "GTE") == 0)
+  {
+    sscanf(command, "%*3s %c", &direction);
+    if (direction == '+')
+    {
+      pulselength = map(90, 0, 180, SERVO_MIN, SERVO_MAX);
+      servos.setPWM(servoID::GATE, 0, pulselength);
+    }
+    else if (direction == '-')
+    {
+      pulselength = map(0, 0, 180, SERVO_MIN, SERVO_MAX);
+      servos.setPWM(servoID::GATE, 0, pulselength);
+    }
+  }
+  // Scissor Lift:     SCI [Direction +|-] [Duration (ms)] ---> "SCI + 10000"
+  else if (strcmp(commandType, "SCI") == 0)
+  {
+    sscanf(command, "%*3s %c %04d", &direction, &time);
+    digitalWrite(SCISSOR_LIFT_UP, LOW);
+    digitalWrite(SCISSOR_LIFT_DOWN, HIGH);
+    Serial.println(command);
+    if (direction == '+')
+    {
+      scissorLiftActuate(1, time * 1000);
+    }
+    else if (direction == '-')
+    {
+      scissorLiftActuate(-1, time * 1000);
+    }
+  }
+  // Forward/Backwards:MOV [Direction +|-] [Revolutions] [Speed (RPM) 0 < X < 1000] ---> "MOV + 2 10"
+  else if (strcmp(commandType, "MOV") == 0)
+  {
+    int Kp = 0;
+    sscanf(command, "%*3s %c %04d %04d %04d", &direction, &time, &speed, &Kp);
+    command[strlen(command) + 1] ='\0';
+    Serial.println("");
+    Serial.println(command);
+
+    yaw_Kp =  ((double) Kp) / 10.0;
+
+    //Reset Array each movement
+    for (int i = 0;i < IMUDataCount;i++){
+      IMUData[i].time = 0;
+      IMUData[i].yaw = 0;
+      IMUData[i].pitch = 0;
+      IMUData[i].roll = 0;
+      IMUData[i].motorLeft = 0;
+      IMUData[i].motorRight = 0;
+    }
+    IMUDataCount = 0;
+
+    if (direction == '+'){
+      forwardBack(1,time,speed);
+    }
+    else if (direction == '-'){
+      forwardBack(-1,time,speed);
+    }
+  }
+  // Rotate:           ROT [Direction +|-] [Angular Displacement] [Speed (RPM) 0 < X < 1000] ---> "ROT - 3 30"
+  else if (strcmp(commandType, "ROT") == 0)
+  {
+    sscanf(command, "%*3s %c %04d %04d", &direction, &deltaAngle , &speed);
+
+    //Reset Array each movement
+    for (int i = 0;i < IMUDataCount;i++){
+      IMUData[i].time = 0;
+      IMUData[i].yaw = 0;
+      IMUData[i].pitch = 0;
+      IMUData[i].roll = 0;
+      IMUData[i].motorRight = 0;
+      IMUData[i].motorLeft = 0;
+    }
+    IMUDataCount = 0;
+
+
+    if (direction == '+')
+    {
+      rotate(1, (double) deltaAngle,speed);
+    }
+    else if (direction == '-')
+    {
+      rotate(-1, (double) deltaAngle,speed);
+    }
+  }
+  // ARM:              ARM [SPEED] [ANGLE] ---> "ARM 50 85"
+  else if (strcmp(commandType, "ARM") == 0)
+  {
+    sscanf(command, "%*3s %04d %04d", &speed, &value);
+    Serial.println(command);
+    if (servoRightAngle > value)
+    {
+      //Arm Comes Out
+      for (int i = servoRightAngle; i > value; i--)
+      {
+        containmentAngle++;
+        servoLeftAngle++;
+        servoRightAngle--;
+        pulselength = map(servoLeftAngle, 0, 270, SERVO_MIN, SERVO_MAX);
+        pulselength2 = map(servoRightAngle, 0, 270, SERVO_MIN, SERVO_MAX);
+        servos.setPWM(servoID::LIFTLEFT, 0, pulselength);
+        servos.setPWM(servoID::LIFTRIGHT, 0, pulselength2);
+        servos.setPWM(servoID::CONTAINMENT,0,map(containmentAngle,0,180,SERVO_MIN,SERVO_MAX));
+        delay(speed);
+      }
+    }
+    else
+    {
+      //Arm Goes Down.
+      for (int i = servoRightAngle; i < value; i++)
+      {
+        containmentAngle--;
+        servoLeftAngle--;
+        servoRightAngle++;
+        pulselength = map(servoLeftAngle, 0, 270, SERVO_MIN, SERVO_MAX);
+        pulselength2 = map(servoRightAngle, 0, 270, SERVO_MIN, SERVO_MAX);
+        servos.setPWM(servoID::LIFTLEFT, 0, pulselength);
+        servos.setPWM(servoID::LIFTRIGHT, 0, pulselength2);
+        servos.setPWM(servoID::CONTAINMENT,0,map(containmentAngle,0,180,SERVO_MIN,SERVO_MAX));
+        delay(speed);
+      }
+    }
+    currentArmAngle = value;
+  }
+  else if (strcmp(commandType, "TES") == 0)
+  {
+    sscanf(command, "%*3s %04d %04d %04d", &servoNum, &speed, &value);
+    servos.setPWM(servoNum, 0, value);
+  }
+  // Get Distance Sensor Reading: "DIS"
+  //  else if (strcmp(commandType,"DIS") == 0){
+  //      Serial.print("Distance(mm): ");
+  //      Serial.print(getdistance());
+  //  }
+  // Get IMU Yaw Reading: "YAW"
+  else if (strcmp(commandType, "YAW") == 0)
+  {
+    outputYaw();
+  }
+  else if (strcmp(commandType, "MTR") == 0)
+  {
+    sscanf(command, "%*3s %c %04d %04d", &direction, &time,&speed);
+    if (direction == '+')
+    {
+      motor(time,speed);
+    }
+    else if (direction == '-')
+    {
+      motor(-1*time,speed);
+    }
+  }
+  commandType[0]='\0';
+  command[0] = '\0';
+}
+
+void scissorLiftActuate(int direction, int duration)
+{
+  // Move Lift Up
+  if (direction == 1)
+  {
+    digitalWrite(SCISSOR_LIFT_UP, HIGH);
+    digitalWrite(SCISSOR_LIFT_DOWN, LOW);
+    delay(duration);
+    digitalWrite(SCISSOR_LIFT_UP, LOW);
+    digitalWrite(SCISSOR_LIFT_DOWN, LOW);
+  }
+  // Move Lift Down
+  else if (direction == -1)
+  {
+    digitalWrite(SCISSOR_LIFT_DOWN, HIGH);
+    digitalWrite(SCISSOR_LIFT_UP, LOW);
+    delay(duration);
+    digitalWrite(SCISSOR_LIFT_DOWN, LOW);
+    digitalWrite(SCISSOR_LIFT_UP, LOW);
+  }
+}
+
+// int getdistance(){
+//   distanceSensor.startRanging(); //Write configuration bytes to initiate measurement
+//   while (!distanceSensor.checkForDataReady())
+//   {
+//     delay(1);
+//   }
+//   int distance = distanceSensor.getDistance(); //Get the result of the measurement from the sensor
+//   distanceSensor.clearInterrupt();
+//   distanceSensor.stopRanging();
+//   return distance;
+// }
+
+void arm(int speed1, int angle)
+{
+  if (servoRightAngle > angle)
+  {
+    for (int i = servoRightAngle; i > angle; i--)
+    {
+      servoLeftAngle++;
+      servoRightAngle--;
+      pulselength = map(servoLeftAngle, 0, 270, SERVO_MIN, SERVO_MAX);
+      pulselength2 = map(servoRightAngle, 0, 270, SERVO_MIN, SERVO_MAX);
+      servos.setPWM(servoID::LIFTLEFT, 0, pulselength);
+      servos.setPWM(servoID::LIFTRIGHT, 0, pulselength2);
+      delay(speed1);
+    }
+  }
+  else
+  {
+    for (int i = servoRightAngle; i < angle; i++)
+    {
+      servoLeftAngle--;
+      servoRightAngle++;
+      pulselength = map(servoLeftAngle, 0, 270, SERVO_MIN, SERVO_MAX);
+      pulselength2 = map(servoRightAngle, 0, 270, SERVO_MIN, SERVO_MAX);
+      servos.setPWM(servoID::LIFTLEFT, 0, pulselength);
+      servos.setPWM(servoID::LIFTRIGHT, 0, pulselength2);
+      delay(speed1);
+    }
+  }
+}
+
+void scoop(int angle)
+{
+  pulselength = map(angle, 0, 180, SERVO_MIN, SERVO_MAX);
+  servos.setPWM(servoID::SCOOP, 0, pulselength);
+  delay(1500);
+}
+
+void gate(int angle)
+{
+  pulselength = map(angle, 0, 180, SERVO_MIN, SERVO_MAX);
+  servos.setPWM(servoID::GATE, 0, pulselength);
+  delay(1000);
+}
+
+ISR(TIMER0_COMPA_vect)
+{
+  drivetime++;
+  sampletime++;
+}
+
+void forwardBack(int direction, int time, int speed1)
+{
+  double iy = 0;
+  double ip = 0;
+  double ir = 0;
+  speed1 = map(speed1, 0, 1000, 0, 255);
+  int motorPowerRight = speed1;
+  int motorPowerLeft  = speed1;
+  int stopTime = 0;
+  double dt = 0.001;
+  double output = 0;
+  double error = 0;
+  bool started = false;
+  bool finished = false;
+
+  //Set Initial Motor Speeds
+  analogWrite(MOTOR_RIGHT_EN, motorPowerRight);
+  analogWrite(MOTOR_LEFT_EN, motorPowerLeft);   
+
+
+  // Start Timer interrupts
+  TCCR0A |= (1 << WGM01);
+  TCCR0B |= (1 << CS01) | (1 << CS00);   // Set Prescalar to 64' (CLK_64)
+  OCR0A = 0b11111010;      // Set output compare value to 250 for TOP every 1ms
+  TIMSK0 |= (1 << OCIE0A); // Enable interrupts for Timer1 OCR2A
+
+  while (true){
+    //1.Start Streaming in IMU Data
+    getYawPitchRoll();
+    if (sampletime > 20 && started)
+    {
+      recordYaw(y,p,r,motorPowerRight,motorPowerLeft);
+      sampletime = 0;
+    }
+
+    if (((drivetime > stopTime) && (stopTime != 0))  || drivetime > 8000)
+    {
+      break;
+    }
+    
+    if ((drivetime > IMU_START_DELAY) && !finished){
+      if (!started)
+      {
+        //2.Start Recording Data
+        started = true;
+        iy = y;
+        ip = p;
+        ir = r;
+        Serial.println("");
+        Serial.print("KP is:");
+        Serial.println(yaw_Kp,4);
+        Serial.println("Starting Values:");
+        Serial.println("Yaw,Pitch,Roll");
+        Serial.print(iy,4);
+        Serial.print(",");
+        Serial.print(ip,4);
+        Serial.print(",");
+        Serial.print(ir,4);
+        Serial.println("");
+      }
+
+      if (((drivetime > IMU_START_DELAY) && (drivetime < time + IMU_START_DELAY)))
+      {
+        //Feedback controller goes here
+        error = iy - y;
+        if (error < -180.0)
+        {
+            error += 360.0;
+        }
+        else if (error > 180.0)
+        {
+            error -= 360.0;
+        }
+
+        if (fabs(error) > 0.3)
+        {
+          output = yaw_Kp * error;
+          if (output > 0)
+          {
+            if (direction == 1)
+            {
+              motorPowerRight = (int)(speed1 * (1.0 + (fabs(output)/100.0)));
+              if (motorPowerRight > 255){
+                motorPowerRight = 255;
+              }
+            }
+            else if (direction == -1){
+              motorPowerLeft = (int)(speed1 * (1.0 + (fabs(output)/100.0)));
+              if (motorPowerLeft > 255){
+                motorPowerLeft = 255;
+              }
+            }
+
+          }
+          else if (output < 0)
+          {
+            if (direction == 1)
+            {
+              motorPowerLeft = (int)(speed1 * (1.0 + (fabs(output)/100.0)));
+              if (motorPowerLeft > 255){
+                motorPowerLeft = 255;
+              }
+            }
+            else if (direction == -1){
+              motorPowerRight = (int)(speed1 * (1.0 + (fabs(output)/100.0)));
+              if (motorPowerRight > 255){
+                motorPowerRight = 255;
+              }
+            }
+          }
+        }
+
+        //Plant Process
+        analogWrite(MOTOR_RIGHT_EN, motorPowerRight);
+        analogWrite(MOTOR_LEFT_EN, motorPowerLeft);
+
+        if (direction == 1)
+        {
+          digitalWrite(MOTOR_RIGHT_IN1, LOW);
+          digitalWrite(MOTOR_RIGHT_IN2, HIGH);
+
+          digitalWrite(MOTOR_LEFT_IN1, LOW);
+          digitalWrite(MOTOR_LEFT_IN2, HIGH);
+        }
+        else if (direction == -1)
+        {
+          digitalWrite(MOTOR_RIGHT_IN1, HIGH);
+          digitalWrite(MOTOR_RIGHT_IN2, LOW);
+
+          digitalWrite(MOTOR_LEFT_IN1, HIGH);
+          digitalWrite(MOTOR_LEFT_IN2, LOW);
+        }
+      }
+      else
+      {
+        digitalWrite(MOTOR_RIGHT_IN1, LOW);
+        digitalWrite(MOTOR_RIGHT_IN2, LOW);
+        digitalWrite(MOTOR_LEFT_IN1, LOW);
+        digitalWrite(MOTOR_LEFT_IN2, LOW);
+        stopTime = drivetime + IMU_END_DELAY;
+        finished = true;
+      }
+    }
+  }
+
+  iy = y;
+  ip = p;
+  ir = r;
+  Serial.println("Ending Values:");
+  Serial.println("Yaw,Pitch,Roll");
+  Serial.print(iy,4);
+  Serial.print(",");
+  Serial.print(ip,4);
+  Serial.print(",");
+  Serial.print(ir,4);
+  Serial.print(",");
+  Serial.println("");
+  Serial.println("Ending Motor PWM Values:");
+  Serial.print("Right:");
+  Serial.print(motorPowerRight);
+  Serial.print("Left:");
+  Serial.print(motorPowerLeft);
+  Serial.println("");
+
+  TIMSK0 &= ~(1 << OCIE0A); // Stop Timer Interrupts
+  drivetime = 0;
+}
+
+void rotate(int direction, double angle,int speed1)
+{
+  double iy = 0;
+  double ip = 0;
+  double ir = 0;
+  double delta = 0;
+  bool started = false;
+  int rotationDirection = 0;
+  int stopTime = 0;
+  speed1 = map(speed1, 0, 1000, 0, 255); // Map the potentiometer value from 0 to 255
+  analogWrite(MOTOR_RIGHT_EN, speed1);  // Send PWM signal to L298N Enable pin
+  analogWrite(MOTOR_LEFT_EN, speed1);   // Send PWM signal to L298N Enable pin
+  // Start Timer interrupts
+  TCCR0A |= (1 << WGM01);
+  TCCR0B |= (1 << CS01) | (1 << CS00);   // Set Prescalar to 64' (CLK_64)
+  OCR0A = 0b11111010;      // Set output compare value to 250 for TOP every 1ms
+  TIMSK0 |= (1 << OCIE0A); // Enable interrupts for Timer0 OCR0
+
+  if (direction == -1)
+  {
+    angle = angle*-1;
+  }
+
+  bool finished = false;
+  while (true){
+
+    //1.Start Streaming in IMU Data
+    getYawPitchRoll();
+    if (sampletime > 20 && started)
+    {
+      recordYaw(y,p,r,speed1,speed1);
+      sampletime = 0;
+    }
+
+    if (((drivetime > stopTime) && (stopTime != 0))  || drivetime > 8000)
+    {
+      digitalWrite(MOTOR_RIGHT_IN1, LOW);
+      digitalWrite(MOTOR_RIGHT_IN2, LOW);
+      digitalWrite(MOTOR_LEFT_IN1, LOW);
+      digitalWrite(MOTOR_LEFT_IN2, LOW);
+      break;
+    }
+    
+    if ((drivetime > IMU_START_DELAY) && !finished){
+      if (!started)
+      {
+        //2.Start Recording Data
+        started = true;
+        iy = y;
+        ip = p;
+        ir = r;
+        Serial.println("");
+        Serial.println("Starting Values:");
+        Serial.println("Yaw,Pitch,Roll");
+        Serial.print(iy,4);
+        Serial.print(",");
+        Serial.print(ip,4);
+        Serial.print(",");
+        Serial.print(ir,4);
+        Serial.println("");
+
+        //3.Calculate Angle to turn to.
+        delta = iy + angle;
+        if (delta < -180.0)
+        {
+            delta += 360.0;
+        }
+        else if (delta > 180.0)
+        {
+            delta -= 360.0;
+        }
+
+        //4.Direction to Rotate
+        if (delta > 0)
+        {
+          rotationDirection = 1;
+        }
+        else
+        {
+          rotationDirection = -1;
+        }
+        Serial.print("Target Angle:");
+        Serial.println(delta,4);
+        Serial.println("");
+      }
+
+      //5.Start Rotation until hit tolerance.
+      if (fabs(y - delta) >= ROTATION_TOLERANCE)
+      {
+        if (rotationDirection == 1)
+        {
+          digitalWrite(MOTOR_RIGHT_IN1, LOW);
+          digitalWrite(MOTOR_RIGHT_IN2, HIGH);
+
+          digitalWrite(MOTOR_LEFT_IN1, HIGH);
+          digitalWrite(MOTOR_LEFT_IN2, LOW);
+        }
+        else if (rotationDirection == -1)
+        {
+          digitalWrite(MOTOR_RIGHT_IN1, HIGH);
+          digitalWrite(MOTOR_RIGHT_IN2, LOW);
+
+          digitalWrite(MOTOR_LEFT_IN1, LOW);
+          digitalWrite(MOTOR_LEFT_IN2, HIGH);
+        }
+      }
+      else
+      {
+        digitalWrite(MOTOR_RIGHT_IN1, LOW);
+        digitalWrite(MOTOR_RIGHT_IN2, LOW);
+        digitalWrite(MOTOR_LEFT_IN1, LOW);
+        digitalWrite(MOTOR_LEFT_IN2, LOW);
+        stopTime = drivetime + IMU_END_DELAY;
+        finished = true;
+      }
+    }
+  }
+
+  iy = y;
+  ip = p;
+  ir = r;
+  Serial.println("Ending Values:");
+  Serial.println("Yaw,Pitch,Roll");
+  Serial.print(iy,4);
+  Serial.print(",");
+  Serial.print(ip,4);
+  Serial.print(",");
+  Serial.print(ir,4);
+  Serial.println("");
+
+  TIMSK0 &= ~(1 << OCIE0A); // Stop Timer Interrupts
+  drivetime = 0;
+}
+
+//IMU Functions
+void init_imu()
+{
+  Serial.println("Initializing IMU....");
+  Wire.begin();
+  Wire.setClock(400000);
+  bool initialized = false;
+  while (!initialized)
+  {
+    // Initialize the ICM-20948
+    // If the DMP is enabled, .begin performs a minimal startup. We need to configure the sample mode etc. manually.
+    myICM.begin(Wire, 1);
+    Serial.print(F("Initialization of the sensor returned: "));
+    Serial.println(myICM.statusString());
+    if (myICM.status != ICM_20948_Stat_Ok)
+    {
+      Serial.println(F("Trying again..."));
+      delay(500);
+    }
+    else
+    {
+      initialized = true;
+    }
+  }
+  Serial.println(F("Device connected!"));
+  bool success = true; // Use success to show if the DMP configuration was successful
+  // Initialize the DMP. initializeDMP is a weak function. You can overwrite it if you want to e.g. to change the sample rate
+  success &= (myICM.initializeDMP() == ICM_20948_Stat_Ok);
+  success &= (myICM.enableDMPSensor(INV_ICM20948_SENSOR_ORIENTATION) == ICM_20948_Stat_Ok);
+  success &= (myICM.setDMPODRrate(DMP_ODR_Reg_Quat9, 0) == ICM_20948_Stat_Ok);
+  success &= (myICM.enableFIFO() == ICM_20948_Stat_Ok);
+  // Enable the DMP
+  success &= (myICM.enableDMP() == ICM_20948_Stat_Ok);
+  // Reset DMP
+  success &= (myICM.resetDMP() == ICM_20948_Stat_Ok);
+  // Reset FIFO
+  success &= (myICM.resetFIFO() == ICM_20948_Stat_Ok);
+  // Check success
+  if (success)
+  {
+    Serial.println(F("DMP enabled!"));
+  }
+  else
+  {
+    Serial.println(F("Enable DMP failed!"));
+    Serial.println(F("Please check that you have uncommented line 29 (#define ICM_20948_USE_DMP) in ICM_20948_C.h..."));
+    while (1)
+      ; // Do nothing more
+  }
+
+  biasStore store;
+
+  EEPROM.get(0, store); // Read existing EEPROM, starting at address 0
+  if (isBiasStoreValid(&store))
+  {
+    Serial.println(F("Bias data in EEPROM is valid. Restoring it..."));
+    success &= (myICM.setBiasGyroX(store.biasGyroX) == ICM_20948_Stat_Ok);
+    success &= (myICM.setBiasGyroY(store.biasGyroY) == ICM_20948_Stat_Ok);
+    success &= (myICM.setBiasGyroZ(store.biasGyroZ) == ICM_20948_Stat_Ok);
+    success &= (myICM.setBiasAccelX(store.biasAccelX) == ICM_20948_Stat_Ok);
+    success &= (myICM.setBiasAccelY(store.biasAccelY) == ICM_20948_Stat_Ok);
+    success &= (myICM.setBiasAccelZ(store.biasAccelZ) == ICM_20948_Stat_Ok);
+    success &= (myICM.setBiasCPassX(store.biasCPassX) == ICM_20948_Stat_Ok);
+    success &= (myICM.setBiasCPassY(store.biasCPassY) == ICM_20948_Stat_Ok);
+    success &= (myICM.setBiasCPassZ(store.biasCPassZ) == ICM_20948_Stat_Ok);
+
+    if (success)
+    {
+      Serial.println(F("Biases restored."));
+      printBiases(&store);
+    }
+    else
+    {
+      Serial.println(F("Bias restore failed!"));
+    }
+  }
+}
+void calibrate_imu(){
+  static unsigned long startTime = millis(); // Save the biases when the code has been running for two minutes
+  static bool biasesStored = false;
+  while (!biasesStored){
+    icm_20948_DMP_data_t data;
+    myICM.readDMPdataFromFIFO(&data);
+
+    //Output While Calibrating
+    if ((myICM.status == ICM_20948_Stat_Ok) || (myICM.status == ICM_20948_Stat_FIFOMoreDataAvail)) // Was valid data available?
+    {
+      if ((data.header & DMP_header_bitmap_Quat9) > 0) // We have asked for orientation data so we should receive Quat9
+      {
+        // Q0 value is computed from this equation: Q0^2 + Q1^2 + Q2^2 + Q3^2 = 1.
+        // In case of drift, the sum will not add to 1, therefore, quaternion data need to be corrected with right bias values.
+        // The quaternion data is scaled by 2^30.
+        // Scale to +/- 1
+        double q1 = ((double)data.Quat9.Data.Q1) / 1073741824.0; // Convert to double. Divide by 2^30
+        double q2 = ((double)data.Quat9.Data.Q2) / 1073741824.0; // Convert to double. Divide by 2^30
+        double q3 = ((double)data.Quat9.Data.Q3) / 1073741824.0; // Convert to double. Divide by 2^30
+        double q0 = sqrt(1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3)));
+        double q2sqr = q2 * q2;
+
+        // roll (x-axis rotation)
+        double t0 = +2.0 * (q0 * q1 + q2 * q3);
+        double t1 = +1.0 - 2.0 * (q1 * q1 + q2sqr);
+        double roll = atan2(t0, t1) * 180.0 / PI;
+
+        // pitch (y-axis rotation)
+        double t2 = +2.0 * (q0 * q2 - q3 * q1);
+        t2 = t2 > 1.0 ? 1.0 : t2;
+        t2 = t2 < -1.0 ? -1.0 : t2;
+        double pitch = asin(t2) * 180.0 / PI;
+
+        // yaw (z-axis rotation)
+        double t3 = +2.0 * (q0 * q3 + q1 * q2);
+        double t4 = +1.0 - 2.0 * (q2sqr + q3 * q3);
+        double yaw = atan2(t3, t4) * 180.0 / PI;
+        Serial.print(F("Roll: "));
+        Serial.print(roll, 1);
+        Serial.print(F("\tPitch: "));
+        Serial.print(pitch, 1);
+        Serial.print(F("\tYaw: "));
+        Serial.println(yaw, 1);
+      }
+    }
+
+    if (myICM.status != ICM_20948_Stat_FIFOMoreDataAvail) // If more data is available then we should read it right away - and not delay
+    {
+      if (!biasesStored) // Should we store the biases?
+      {
+        if (millis() > (startTime + 120000)) // Is it time to store the biases?
+        {
+          Serial.println(F("\r\n\r\n\r\nSaving bias data..."));
+
+          biasStore store;
+    
+          bool success = (myICM.getBiasGyroX(&store.biasGyroX) == ICM_20948_Stat_Ok);
+          success &= (myICM.getBiasGyroY(&store.biasGyroY) == ICM_20948_Stat_Ok);
+          success &= (myICM.getBiasGyroZ(&store.biasGyroZ) == ICM_20948_Stat_Ok);
+          success &= (myICM.getBiasAccelX(&store.biasAccelX) == ICM_20948_Stat_Ok);
+          success &= (myICM.getBiasAccelY(&store.biasAccelY) == ICM_20948_Stat_Ok);
+          success &= (myICM.getBiasAccelZ(&store.biasAccelZ) == ICM_20948_Stat_Ok);
+          success &= (myICM.getBiasCPassX(&store.biasCPassX) == ICM_20948_Stat_Ok);
+          success &= (myICM.getBiasCPassY(&store.biasCPassY) == ICM_20948_Stat_Ok);
+          success &= (myICM.getBiasCPassZ(&store.biasCPassZ) == ICM_20948_Stat_Ok);
+
+          updateBiasStoreSum(&store);
+        
+          if (success)
+          {
+            biasesStored = true; // Only attempt this once
+          
+            EEPROM.put(0, store); // Write biases to EEPROM, starting at address 0
+            EEPROM.get(0, store); // Read existing EEPROM, starting at address 0
+            if (isBiasStoreValid(&store))
+            {
+              Serial.println(F("Biases stored."));
+              printBiases(&store);
+              Serial.println(F("\r\n\r\n\r\n"));
+            }
+            else
+              Serial.println(F("Bias store failed!\r\n\r\n\r\n"));
+          }
+          else
+          {
+            Serial.println(F("Bias read failed!\r\n\r\n\r\n"));
+          }
+        }
+      }
+      delay(10);
+    }
+  }
+}
+void updateBiasStoreSum(biasStore *store) // Update the bias store checksum
+{
+  int32_t sum = store->header;
+  sum += store->biasGyroX;
+  sum += store->biasGyroY;
+  sum += store->biasGyroZ;
+  sum += store->biasAccelX;
+  sum += store->biasAccelY;
+  sum += store->biasAccelZ;
+  sum += store->biasCPassX;
+  sum += store->biasCPassY;
+  sum += store->biasCPassZ;
+  store->sum = sum;
+}
+bool isBiasStoreValid(biasStore *store) // Returns true if the header and checksum are valid
+{
+  int32_t sum = store->header;
+
+  if (sum != 0x42)
+    return false;
+
+  sum += store->biasGyroX;
+  sum += store->biasGyroY;
+  sum += store->biasGyroZ;
+  sum += store->biasAccelX;
+  sum += store->biasAccelY;
+  sum += store->biasAccelZ;
+  sum += store->biasCPassX;
+  sum += store->biasCPassY;
+  sum += store->biasCPassZ;
+
+  return (store->sum == sum);
+}
+void printBiases(biasStore *store)
+{
+  Serial.print(F("Gyro X: "));
+  Serial.print(store->biasGyroX);
+  Serial.print(F(" Gyro Y: "));
+  Serial.print(store->biasGyroY);
+  Serial.print(F(" Gyro Z: "));
+  Serial.println(store->biasGyroZ);
+  Serial.print(F("Accel X: "));
+  Serial.print(store->biasAccelX);
+  Serial.print(F(" Accel Y: "));
+  Serial.print(store->biasAccelY);
+  Serial.print(F(" Accel Z: "));
+  Serial.println(store->biasAccelZ);
+  Serial.print(F("CPass X: "));
+  Serial.print(store->biasCPassX);
+  Serial.print(F(" CPass Y: "));
+  Serial.print(store->biasCPassY);
+  Serial.print(F(" CPass Z: "));
+  Serial.println(store->biasCPassZ);
+
+}
+void getYawPitchRoll()
+{
+  // Read any DMP data waiting in the FIFO
+  // Note:
+  //    readDMPdataFromFIFO will return ICM_20948_Stat_FIFONoDataAvail if no data is available.
+  //    If data is available, readDMPdataFromFIFO will attempt to read _one_ frame of DMP data.
+  //    readDMPdataFromFIFO will return ICM_20948_Stat_FIFOIncompleteData if a frame was present but was incomplete
+  //    readDMPdataFromFIFO will return ICM_20948_Stat_Ok if a valid frame was read.
+  //    readDMPdataFromFIFO will return ICM_20948_Stat_FIFOMoreDataAvail if a valid frame was read _and_ the FIFO contains more (unread) data.
+  icm_20948_DMP_data_t data;
+  myICM.readDMPdataFromFIFO(&data);
+
+  if ((myICM.status == ICM_20948_Stat_Ok) || (myICM.status == ICM_20948_Stat_FIFOMoreDataAvail)) // Was valid data available?
+  {
+    // Serial.print(F("Received data! Header: 0x")); // Print the header in HEX so we can see what data is arriving in the FIFO
+    // if ( data.header < 0x1000) Serial.print( "0" ); // Pad the zeros
+    // if ( data.header < 0x100) Serial.print( "0" );
+    // if ( data.header < 0x10) Serial.print( "0" );
+    // Serial.println( data.header, HEX );
+
+    if ((data.header & DMP_header_bitmap_Quat9) > 0) // We have asked for orientation data so we should receive Quat9
+    {
+      // Q0 value is computed from this equation: Q0^2 + Q1^2 + Q2^2 + Q3^2 = 1.
+      // In case of drift, the sum will not add to 1, therefore, quaternion data need to be corrected with right bias values.
+      // The quaternion data is scaled by 2^30.
+      // Serial.printf("Quat9 data is: Q1:%ld Q2:%ld Q3:%ld Accuracy:%d\r\n", data.Quat9.Data.Q1, data.Quat9.Data.Q2, data.Quat9.Data.Q3, data.Quat9.Data.Accuracy);
+      // Scale to +/- 1
+      double q1 = ((double)data.Quat9.Data.Q1) / 1073741824.0; // Convert to double. Divide by 2^30
+      double q2 = ((double)data.Quat9.Data.Q2) / 1073741824.0; // Convert to double. Divide by 2^30
+      double q3 = ((double)data.Quat9.Data.Q3) / 1073741824.0; // Convert to double. Divide by 2^30
+      double q0 = sqrt(1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3)));
+      double q2sqr = q2 * q2;
+      
+
+      // roll (x-axis rotation)
+      double t0 = +2.0 * (q0 * q1 + q2 * q3);
+      double t1 = +1.0 - 2.0 * (q1 * q1 + q2sqr);
+      double roll = atan2(t0, t1) * 180.0 / PI;
+
+      // pitch (y-axis rotation)
+      double t2 = +2.0 * (q0 * q2 - q3 * q1);
+      t2 = t2 > 1.0 ? 1.0 : t2;
+      t2 = t2 < -1.0 ? -1.0 : t2;
+      double pitch = asin(t2) * 180.0 / PI;
+
+      // yaw (z-axis rotation)
+      double t3 = +2.0 * (q0 * q3 + q1 * q2);
+      double t4 = +1.0 - 2.0 * (q2sqr + q3 * q3);
+      double yaw = atan2(t3, t4) * 180.0 / PI;
+      
+      y = yaw;
+      p = pitch;
+      r = roll;
+
+      // Serial.print(y,3);
+      // Serial.print(",");
+      // Serial.print(p,3);
+      // Serial.print(",");
+      // Serial.print(r,3);
+      // Serial.println("");
+
+      // Output the Quaternion data in the format expected by ZaneL's Node.js Quaternion animation tool
+      // Serial.print(F("{\"quat_w\":"));
+      // Serial.print(q0, 3);
+      // Serial.print(F(", \"quat_x\":"));
+      // Serial.print(q1, 3);
+      // Serial.print(F(", \"quat_y\":"));
+      // Serial.print(q2, 3);
+      // Serial.print(F(", \"quat_z\":"));
+      // Serial.print(q3, 3);
+      // Serial.println(F("}"));
+
+      // Serial.print("Yaw: ");
+      // Serial.print(y,3);
+      // Serial.print(" ");
+      // Serial.print("Pitch: ");
+      // Serial.print(p,3);
+      // Serial.print(" ");
+      // Serial.print("Roll: ");
+      // Serial.print(r,3);
+      // Serial.println("");
+
+    }
+  }
+  if (myICM.status != ICM_20948_Stat_FIFOMoreDataAvail) // If more data is available then we should read it right away - and not delay
+  {
+    delay(10);
+  }
+}
+
+void recordYaw(double& yaw, double& pitch, double& roll,int right,int left)
+{
+  if (IMUDataCount < IMU_DATA_SIZE)
+  {
+    IMUData[IMUDataCount].time = drivetime - IMU_START_DELAY;
+    IMUData[IMUDataCount].yaw = yaw ;
+    IMUData[IMUDataCount].pitch = pitch;
+    IMUData[IMUDataCount].roll = roll;
+    IMUData[IMUDataCount].motorRight = right;
+    IMUData[IMUDataCount].motorLeft = left;
+    IMUDataCount++;
+  }
+  else
+  {
+    //Zero out array to prevent overflow.
+    for (int i = 0 ; i < IMUDataCount;i++)
+    {
+      IMUData[i].time = 0;
+      IMUData[i].yaw = 0;
+      IMUData[i].pitch = 0;
+      IMUData[i].roll = 0;
+      IMUData[i].motorRight = 0;
+      IMUData[i].motorLeft = 0;
+    }
+    IMUDataCount = 0;
+  }
+}
+
+void outputYaw()
+{
+  Serial.println("");
+  delay(500);
+  Serial.println("");
+  delay(500);
+  Serial.println("Time,Yaw,Pitch,Roll,Right,Left");
+  delay(1000);
+  for (int i = 0;i<IMUDataCount;i++)
+  {
+    Serial.print(IMUData[i].time);
+    Serial.print(",");
+    Serial.print(IMUData[i].yaw,3);
+    Serial.print(",");
+    Serial.print(IMUData[i].pitch,3);
+    Serial.print(",");
+    Serial.print(IMUData[i].roll,3);
+    Serial.print(",");
+    Serial.print(IMUData[i].motorRight);
+    Serial.print(",");
+    Serial.print(IMUData[i].motorLeft);
+    Serial.println("");
+    delay(100);
+  }
+}
+
+//EEPROM Management:
+void dumpMemory(uint16_t stop){
+  Serial.println("");
+  Serial.print("DUMPING EEPROM to Address:");
+  Serial.println(stop);
+  int value = 0;
+  if (stop > EEPROM.length()){
+    stop = EEPROM.length();
+  }
+  for (uint16_t i = 0; i< stop;i++){
+    value = EEPROM.read(i);
+    Serial.print("Location:");
+    Serial.print(i);
+    Serial.print(" Value:");
+    Serial.print(value);
+    Serial.println("");
+  }
+}
+
+void init_motor()
+{
+  for(int k = 0; k < NMOTORS; k++)
+  {
+    pinMode(enca[k],INPUT);
+    pinMode(encb[k],INPUT);
+    pinMode(pwm[k],OUTPUT);
+    pinMode(in1[k],OUTPUT);
+    pinMode(in2[k],OUTPUT);
+    pid[k].setParams(1,0,0,127);
+  }
+  attachInterrupt(digitalPinToInterrupt(enca[0]), readEncoder0 , RISING);
+  attachInterrupt(digitalPinToInterrupt(enca[1]), readEncoder1 , RISING);
+  Serial.println("Motors Initialized!");
+}
+
+void motor(int revs, int speed1)
+{
+  long pos[2];
+  long currT = micros();
+  long startTime = millis();
+  long currentTime = millis();
+  for(int k = 0; k < NMOTORS; k++)
+  {
+    pid[k].setParams(1,0,0,speed1);
+  }
+  while ((currentTime - startTime) <  revs){
+    currentTime = millis();
+    //Time difference
+    currT = micros();
+    float deltaT = ((float) (currT - prevT))/( 1.0e6 );
+    prevT = currT;
+    //Set target position
+    setTarget(currT/1.0e6,deltaT);
+    //Read the position in an atomic block to avoid a potential misread 
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+      for(int k = 0; k < NMOTORS; k++){
+        pos[k] = posi[k];
+      }
+    }
+
+    // Loop through the motors
+    for(int k = 0; k < NMOTORS; k++){
+      int pwr, dir;
+      pid[k].evalu(pos[k],target[k],deltaT,pwr,dir); // compute the position
+      setMotor(dir,pwr,pwm[k],in1[k],in2[k]); // signal the motor
+    }
+  }
+
+  setMotor(0,0,0,in1[0],in2[0]);
+  setMotor(0,0,0,in1[1],in2[1]);
+}
+
+void setTarget(float t, float deltat){
+
+  float positionChange[4] = {0.0,0.0,0.0,0.0};
+  float pulsesPerTurn = 16*43.8; 
+  float pulsesPerMeter = pulsesPerTurn*9.87;
+  float velocity = 0.25; // m/s
+
+  for(int k = 0; k < 2; k++){ 
+      positionChange[k] = velocity*deltat*pulsesPerMeter; 
+  } 
+
+  for(int k = 0; k < 2; k++){
+    target_f[k] = target_f[k] + positionChange[k];
+  }
+  target[0] = (long) target_f[0];
+  target[1] = (long) -target_f[1];
+}
+
+void setMotor(int dir, int pwmVal, int pwm, int in1, int in2)
+{
+  analogWrite(pwm,pwmVal);
+  if(dir == 1)
+  {
+    digitalWrite(in1,HIGH);
+    digitalWrite(in2,LOW);
+  }
+  else if(dir == -1)
+  {
+    digitalWrite(in1,LOW);
+    digitalWrite(in2,HIGH);
+  }
+  else
+  {
+    digitalWrite(in1,LOW);
+    digitalWrite(in2,LOW);
+  }  
+}
+
+void readEncoder0()
+{
+  int b = digitalRead(encb[0]);
+  if(b > 0)
+  {
+    posi[0]++;
+  }
+  else
+  {
+    posi[0]--;
+  }
+}
+
+void readEncoder1()
+{
+  int b = digitalRead(encb[1]);
+  if(b > 0)
+  {
+    posi[1]++;
+  }
+  else
+  {
+    posi[1]--;
+  }
+}
